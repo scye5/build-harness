@@ -1,4 +1,4 @@
-"""Run the chess server in a Modal sandbox and play moves against it.
+"""Run the chess server in a Modal or Docker sandbox and play moves against it.
 
 This is the part 2 surface. It does not know anything about fixing the bug: it
 takes an optional patch (the fix produced in part 1), applies it to the
@@ -9,6 +9,10 @@ from __future__ import annotations
 
 import base64
 import json
+import shutil
+import subprocess
+import tempfile
+import uuid
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -36,9 +40,30 @@ SANDBOX_FILES = (
     Path(__file__).with_name("sandbox_python.py"),
 )
 
-def _with_assignment_files(image):
+def _with_assignment_files(image, backend: str = "modal"):
     """Copy the files the sandbox runs into /opt/assignment."""
 
+    if backend == "docker":
+        with tempfile.TemporaryDirectory(prefix="assignment-chess-") as temporary:
+            root = Path(temporary)
+            context = root / "files"
+            context.mkdir()
+            for source in SANDBOX_FILES:
+                shutil.copy2(source, context / source.name)
+            # BuildKit's containerd image store resolves local tags in FROM,
+            # but can treat an untagged manifest ID as a registry image name.
+            base_tag = f"assignment/chess-support-base:{uuid.uuid4().hex}"
+            subprocess.run(["docker", "image", "tag", image, base_tag], check=True)
+            dockerfile = f"FROM {base_tag}\nCOPY . /opt/assignment/\n"
+            image_id = root / "image-id"
+            try:
+                subprocess.run(
+                    ["docker", "build", "--iidfile", str(image_id), "-f", "-", str(context)],
+                    input=dockerfile, text=True, check=True,
+                )
+            finally:
+                subprocess.run(["docker", "image", "rm", base_tag], check=True, stdout=subprocess.DEVNULL)
+            return image_id.read_text().strip()
     for source in SANDBOX_FILES:
         image = image.add_local_file(
             str(source),
@@ -48,7 +73,7 @@ def _with_assignment_files(image):
     return image
 
 class ChessSandbox(Environment):
-    """A chess server hosted in an isolated Modal sandbox.
+    """A chess server hosted in an isolated Modal or Docker sandbox.
 
     Built from the same testbed image the evaluation harness uses, so the code
     under test and the code being played are identical. Without a patch the
@@ -66,6 +91,7 @@ class ChessSandbox(Environment):
         runtime_timeout: float = 600,
         deployment_timeout: float = 1800,
         server_timeout: float = 30,
+        backend: str = "modal",
     ):
         """Launch the sandbox and block until the server answers.
 
@@ -74,7 +100,8 @@ class ChessSandbox(Environment):
                 `Task`. Defaults to the chess task.
             patch: A unified diff applied to the testbed before the server
                 starts, normally the fix from part 1.
-            port: Port to serve on, forwarded through an encrypted tunnel.
+            port: Container port, forwarded via Modal TLS or Docker localhost.
+            backend: "modal" (default) or "docker".
             strict: Refuse to build when the local checkout does not match the
                 task's base commit.
             startup_timeout: Seconds to wait for the SWE-ReX runtime.
@@ -82,7 +109,7 @@ class ChessSandbox(Environment):
             deployment_timeout: Seconds the sandbox may stay alive.
             server_timeout: Seconds to wait for `/health` to succeed.
         """
-        if not 1 <= port <= 65535:
+        if not 1 <= port <= 65535 or port == 8880:
             raise ValueError(f"Invalid port: {port}")
 
         self.task = task if isinstance(task, Task) else Task.load(task or DEFAULT_TASK)
@@ -91,11 +118,15 @@ class ChessSandbox(Environment):
         self._client: httpx.Client | None = None
 
         super().__init__(
-            image=_with_assignment_files(build_testbed_image(self.task, strict=strict)),
+            image=_with_assignment_files(
+                build_testbed_image(self.task, strict=strict, backend=backend), backend,
+            ),
+            backend=backend,
             startup_timeout=startup_timeout,
             runtime_timeout=runtime_timeout,
             deployment_timeout=deployment_timeout,
-            modal_sandbox_kwargs={"encrypted_ports": [port]},
+            modal_sandbox_kwargs={"encrypted_ports": [port]} if backend == "modal" else None,
+            published_ports=[port] if backend == "docker" else None,
         )
 
         try:
@@ -208,25 +239,27 @@ def main() -> None:
     """Launch a chess sandbox and keep it alive until the user exits."""
     import argparse
 
-    parser = argparse.ArgumentParser(description="Serve the chess app from a Modal sandbox")
+    parser = argparse.ArgumentParser(description="Serve the chess app from an isolated sandbox")
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument("--patch", type=Path, help="Fix to apply before serving, e.g. the part 1 output")
     parser.add_argument("--task", type=Path, help="Task directory to serve the testbed of")
     parser.add_argument(
         "--sandbox-timeout",
         type=int,
         default=1800,
-        help="maximum lifetime of the Modal sandbox in seconds",
+        help="maximum lifetime of the sandbox in seconds",
     )
     args = parser.parse_args()
 
     with ChessSandbox(
+        backend=args.backend,
         task=args.task,
         patch=args.patch,
         deployment_timeout=args.sandbox_timeout,
     ) as sandbox:
         print(f"Chess sandbox ready: {sandbox.server_url}", flush=True)
         try:
-            while True:
+            while sandbox.is_alive():
                 time.sleep(1)
         except KeyboardInterrupt:
             print("\nStopping chess sandbox…", flush=True)

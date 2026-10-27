@@ -52,6 +52,7 @@ def _add_compaction_argument(parser: argparse.ArgumentParser) -> None:
 def _add_code_agent_arguments(parser: argparse.ArgumentParser) -> None:
     """The arguments both code-agent runners take, so they cannot drift apart."""
     parser.add_argument("--model")
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument("--step-limit", type=int, default=100)
     _add_compaction_argument(parser)
     parser.add_argument(
@@ -99,7 +100,8 @@ def run_code_agent() -> None:
 
     submitted_patch = ""
     with Environment(
-        image=build_testbed_image(task),
+        image=build_testbed_image(task, backend=args.backend),
+        backend=args.backend,
         cwd="/testbed",
     ) as environment:
         agent = CodeAgent(
@@ -151,7 +153,7 @@ def run_swebench_agent() -> None:
     # but never activate it, so without this `python` is conda's base env and
     # the repository's own dependencies are missing.
     with Environment(
-        image=instance.image, cwd="/testbed", conda_env="testbed"
+        image=instance.image, cwd="/testbed", conda_env="testbed", backend=args.backend,
     ) as environment:
         agent = CodeAgent(
             task=instance.problem_statement,
@@ -183,6 +185,7 @@ def run_chess_agent() -> None:
     """Apply the Part 1 patch, then let ChessAgent play through the API."""
 
     parser = argparse.ArgumentParser(description=run_chess_agent.__doc__)
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument("--task", type=Path, default=DEFAULT_TASK)
     parser.add_argument("--model")
     parser.add_argument("--step-limit", type=int, default=200)
@@ -209,6 +212,7 @@ def run_chess_agent() -> None:
 
     model = _model(args.model)
     with ChessSandbox(
+        backend=args.backend,
         task=args.task,
         patch=patch,
         deployment_timeout=args.sandbox_timeout,

@@ -21,6 +21,7 @@ from assignment.eval import EvaluationSpec, Task, evaluate
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument("--task", required=True, type=Path, help="Task directory containing task.json")
     parser.add_argument(
         "--evaluation",
@@ -51,6 +52,7 @@ def main() -> int:
         task=task,
         timeout=args.timeout,
         strict=args.strict,
+        backend=args.backend,
     )
     print(report.summary())
     return 0 if report.resolved else 1

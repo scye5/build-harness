@@ -30,10 +30,10 @@ API, so no local GPU is needed. The Django SWE-bench task may require more
 memory and disk than the chess task; its resource requirements have not
 been measured on this laptop.
 
-**Implementation status:** the current code still launches Modal sandboxes.
-These instructions prepare Docker and allow offline development; full agent
-runs require the backend adaptation listed below. There is currently no
-Docker backend flag. Installing Docker alone does not change that.
+**Implementation status:** Docker is supported by the environment, task-image
+builder, chess sandbox, CLI, diagnostics, and evaluators. Pass `--backend docker`
+to a command or `BACKEND=docker` to Make targets. Modal remains the default for
+course grading. Student agent TODOs still need to be implemented separately.
 
 #### 1. Install WSL and Docker Desktop
 
@@ -147,24 +147,58 @@ make test
 Public tests are offline and non-billable. Failures for unimplemented student
 TODOs are expected.
 
-#### 6. Required work before end-to-end Docker runs
+#### 6. Docker backend and validation
 
-The infrastructure still needs the following changes:
+The infrastructure supports the following:
 
-- Add a Docker deployment to `src/assignment/env.py`, preserving command
-  results, timeouts, environment variables, liveness, and cleanup. SWE-ReX
-  provides [DockerDeployment](https://swe-rex.com/latest/api/deployments/docker/).
-- Build local images in `src/assignment/utils/image.py`, retaining source
-  verification, excluded files, and final task dependency pins.
-- Copy chess support files into the image and replace Modal tunnels with
-  localhost-only port publishing in `src/assignment/chess_sandbox.py`.
-- Add backend selection to the CLI and evaluation scripts, including
-  SWE-bench images and the `testbed` Conda environment; adapt diagnostics and
-  integration tests while retaining Modal support for course grading.
+- Implemented: Docker deployment in `src/assignment/env.py`, preserving command
+  results, timeouts, environment variables, liveness, and cleanup through
+  SWE-ReX [DockerDeployment](https://swe-rex.com/latest/api/deployments/docker/).
+  Use a prebuilt image containing Python 3, `/bin/sh`, and bash. The control
+  port binds only to localhost, and a container-side supervisor enforces
+  `deployment_timeout` even if the harness exits. Image pulling precedes the
+  runtime startup timeout. Modal remains the default backend.
+  Run `uv run python scripts/check_docker_env.py` for offline adapter checks;
+  add `--integration` for a real local container test (downloads an image and
+  SWE-ReX, but makes no LLM or Modal calls).
+- Implemented: local images in `src/assignment/utils/image.py`. Call
+  `build_testbed_image(task, backend="docker", tag="assignment/chess:local")`
+  and pass the returned image ID to `Environment(backend="docker", image=image)`.
+  Source verification and excluded files are retained, task pins are applied
+  last, and `force_build=True` disables the Docker build cache. Source symlinks
+  are rejected to prevent aliases from bypassing exclusions. Modal remains
+  the default. Run `uv run python scripts/check_docker_image.py` for offline
+  checks, or add `--integration` to build and inspect the chess task image.
+- Chess support files are copied into `/opt/assignment` in the Docker image.
+  The chess API and SWE-ReX control API publish only on `127.0.0.1`, on separate
+  host ports. Each chess instance gets its own dynamically allocated host port.
+- CLI, evaluation scripts, and diagnostics accept `--backend modal|docker`.
+  SWE-bench uses its published image and activates the `testbed` Conda environment
+  for both agent commands and evaluations. Modal support and integration targets
+  remain available for grading.
 
-Until implemented, `make doctor`, agent runs, `check-part1`, `check-swebench`,
-and Modal integration targets still require Modal. Passing public tests or
-hello-world does not verify full Docker execution. Keep credentials and the
+Run in Ubuntu/WSL:
+
+```bash
+uv run assignment-doctor --backend docker --offline
+make test-docker
+make run-chess BACKEND=docker
+make run-code-agent BACKEND=docker
+make check-part1 BACKEND=docker
+make run-swebench-agent BACKEND=docker
+make check-swebench BACKEND=docker
+```
+
+`make test-docker` runs adapter checks, a real chess API test, and the unmodified
+chess evaluation baseline. It expects the known task regression to fail and the
+other graded tests to pass. It makes no LLM or Modal calls. To separately check
+the larger Django image and Conda setup, run
+`uv run python scripts/check_backends.py --swebench`. Image pulls and dependency
+installation require network access; API-driven agent runs still cost credits.
+Use `make test-modal` and `make test-chess-modal` for the original billable route.
+
+Passing public tests or hello-world does not verify full Docker execution.
+Keep credentials and the
 Docker socket out of agent containers, and copy task sources into them rather
 than exposing the host checkout for writing.
 
@@ -348,8 +382,8 @@ Run the vendored `django__django-15368` task with a 6,000-token threshold:
 COMPACT_THRESHOLD=6000 \
 SWEBENCH_PATCH=artifacts/django__django-15368.patch \
 SWEBENCH_TRAJECTORY=artifacts/django__django-15368-trajectory.json \
-make run-swebench-agent INSTANCE=django__django-15368
-make check-swebench INSTANCE=django__django-15368
+make run-swebench-agent BACKEND=docker INSTANCE=django__django-15368
+make check-swebench BACKEND=docker INSTANCE=django__django-15368
 ```
 
 Set `COMPACT_THRESHOLD=0` to omit the compaction flag and run a full-context
@@ -359,7 +393,7 @@ baseline. Use distinct output names when retaining both runs, for example:
 COMPACT_THRESHOLD=0 \
 SWEBENCH_PATCH=artifacts/django__django-15368-baseline.patch \
 SWEBENCH_TRAJECTORY=artifacts/django__django-15368-baseline-trajectory.json \
-make run-swebench-agent INSTANCE=django__django-15368
+make run-swebench-agent BACKEND=docker INSTANCE=django__django-15368
 ```
 
 The submitted compacted run must trigger at least one compaction, materially reduce active context, and produce a patch that passes `check-swebench`. Generation is stochastic, so it need not use fewer ReAct steps than every baseline sample. 
@@ -483,28 +517,28 @@ The trajectory must show `invoke_skill`, then `run_python` code that calls `simu
 The assignment is worth **100 points**. Each row is graded independently; a
 failed stochastic model run does not erase unrelated implementation credit.
 
-| Part | Criterion | Points | Evidence |
-|---|---|---|---|
-| 1 | Prompt construction and valid action/observation history | 6 | Private unit tests |
-| 1 | ReAct lifecycle, text-only recovery, step limit, cleanup, trajectory | 6 | Private unit tests |
-| 1 | Coding-tool dispatch, recoverable errors, patch submission | 6 | Private unit tests |
-| 1 | Chess patch applies and passes private/regression tests | 8 | Patch replay in fresh testbed |
-| 1 | Skill discovery and `invoke_skill` behavior | 4 | Private tests |
-| 2 | Compaction trigger and model-generated summary | 6 | Private tests and trajectory |
-| 2 | Original instructions and complete recent tool step remain valid | 6 | Private tests and trajectory |
-| 2 | Auditable compaction materially reduces active context | 4 | Compaction events and usage |
-| 2 | Full context vs. compaction token usage analysis report | 4 | Report |
-| 2 | SWE-bench patch passes FAIL_TO_PASS and PASS_TO_PASS | 8 | Patch replay |
-| 3 | `play_move` schema and registration | 4 | Private tests |
-| 3 | `play_move` state updates and recoverable errors | 6 | Private tests |
-| 3 | Basic chess trajectory reaches a terminal state | 4 | Trajectory and result |
-| 3 | Four-run observation A/B experiment is complete | 4 | Four trajectories, four results |
-| 3 | Observation A/B experiment report | 4 | Report |
-| 3 | `simulate_move` stateless behavior and errors | 6 | Private unit/integration tests |
-| 3 | `run_python` sandbox execution, state refresh, errors | 6 | Private tests with sandbox stand-in |
-| 3 | Skill trajectory combines skill, programmatic search, and live move | 6 | Trajectory replay |
-| — | Complete, parseable, rule-compliant submission | 2 | Archive validation |
-| | **Total** | **100** | |
+| Part | Criterion                                                            | Points  | Evidence                            |
+| ---- | -------------------------------------------------------------------- | ------- | ----------------------------------- |
+| 1    | Prompt construction and valid action/observation history             | 6       | Private unit tests                  |
+| 1    | ReAct lifecycle, text-only recovery, step limit, cleanup, trajectory | 6       | Private unit tests                  |
+| 1    | Coding-tool dispatch, recoverable errors, patch submission           | 6       | Private unit tests                  |
+| 1    | Chess patch applies and passes private/regression tests              | 8       | Patch replay in fresh testbed       |
+| 1    | Skill discovery and `invoke_skill` behavior                          | 4       | Private tests                       |
+| 2    | Compaction trigger and model-generated summary                       | 6       | Private tests and trajectory        |
+| 2    | Original instructions and complete recent tool step remain valid     | 6       | Private tests and trajectory        |
+| 2    | Auditable compaction materially reduces active context               | 4       | Compaction events and usage         |
+| 2    | Full context vs. compaction token usage analysis report              | 4       | Report                              |
+| 2    | SWE-bench patch passes FAIL_TO_PASS and PASS_TO_PASS                 | 8       | Patch replay                        |
+| 3    | `play_move` schema and registration                                  | 4       | Private tests                       |
+| 3    | `play_move` state updates and recoverable errors                     | 6       | Private tests                       |
+| 3    | Basic chess trajectory reaches a terminal state                      | 4       | Trajectory and result               |
+| 3    | Four-run observation A/B experiment is complete                      | 4       | Four trajectories, four results     |
+| 3    | Observation A/B experiment report                                    | 4       | Report                              |
+| 3    | `simulate_move` stateless behavior and errors                        | 6       | Private unit/integration tests      |
+| 3    | `run_python` sandbox execution, state refresh, errors                | 6       | Private tests with sandbox stand-in |
+| 3    | Skill trajectory combines skill, programmatic search, and live move  | 6       | Trajectory replay                   |
+| —    | Complete, parseable, rule-compliant submission                       | 2       | Archive validation                  |
+|      | **Total**                                                            | **100** |                                     |
 
 The grader replays patches and submitted trajectories; it does not make new LLM calls. Missing or inconsistent evidence loses credit only for the affected row. Instructor tests and reference patches are not included in this repo.
 

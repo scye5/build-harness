@@ -1,9 +1,9 @@
-"""Build a task's testbed image on Modal from a local checkout.
+"""Build a task's testbed image on Modal or local Docker from a checkout.
 
 The repository under test is copied in from `task.source` — normally the
-`chess_app/` submodule — rather than cloned inside the build. That keeps the
-build offline, works with a private repository without any credential, and
-avoids a network round trip on every rebuild.
+`chess_app/` submodule — rather than cloned inside the build. Copying a private
+repository requires no credentials or network round trip. Installing image
+dependencies can still require network access.
 
 The cost is that the image reflects whatever is on disk, so `verify_source`
 checks the `chess_app` source before every build to confirm it matches the
@@ -13,11 +13,16 @@ already-fixed working tree would make a broken agent look like it passed.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import modal
+from swerex import __version__ as swerex_version
 
 from assignment.task import Task
 
@@ -74,6 +79,9 @@ def verify_source(task: Task, strict: bool = True) -> None:
         )
 
     dirty = _git(task.source, "status", "--porcelain")
+    if dirty.returncode != 0:
+        complain(f"Cannot check {task.source} for changes: {dirty.stderr.strip()}")
+        return
     if dirty.stdout.strip():
         # Each line is a status code then the path. The code's width varies, so
         # split on whitespace rather than slicing at a fixed offset.
@@ -84,21 +92,90 @@ def verify_source(task: Task, strict: bool = True) -> None:
             "which silently invalidates the evaluation if one of them is the fix."
         )
 
-def build_testbed_image(task: Task, strict: bool = True, force_build: bool = False) -> modal.Image:
+def _build_docker_image(task: Task, force_build: bool, tag: str | None) -> str:
+    """Send only filtered source files to Docker; return the immutable image ID."""
+    dockerfile = task.dockerfile.read_text(encoding="utf-8")
+    # Containers are disposable: bootstrap the runtime in a cached image layer,
+    # not on every start. Isolate its dependencies from the task's Python and
+    # expose only the executable, so task commands still use the task's Python.
+    dockerfile += "\nRUN " + json.dumps(
+        ["python3", "-m", "venv", "/opt/assignment-swerex"]
+    ) + "\nRUN " + json.dumps(
+        ["/opt/assignment-swerex/bin/python", "-m", "pip", "install",
+         "--no-cache-dir", f"swe-rex=={swerex_version}"]
+    ) + "\nRUN " + json.dumps(
+        ["ln", "-s", "/opt/assignment-swerex/bin/swerex-remote",
+         "/usr/local/bin/swerex-remote"]
+    ) + "\n"
+    if task.pins:
+        # JSON exec form preserves requirement strings without shell expansion.
+        # This must remain the final build instruction, after task installation.
+        dockerfile += "\nRUN " + json.dumps(
+            ["python", "-m", "pip", "install", "--no-cache-dir", *task.pins]
+        ) + "\n"
+
+    with tempfile.TemporaryDirectory(prefix="assignment-docker-") as temporary:
+        root = Path(temporary)
+        context = root / "source"
+
+        def ignore(directory: str, names: list[str]) -> list[str]:
+            excluded = []
+            for name in names:
+                path = Path(directory) / name
+                if is_ignored(path.relative_to(task.source)):
+                    excluded.append(name)
+                elif path.is_symlink():
+                    # Never dereference an alias to a credential, ignored file,
+                    # or path outside the verified source tree.
+                    raise ValueError(f"Docker build source contains a symlink: {path}")
+            return excluded
+
+        shutil.copytree(task.source, context, ignore=ignore)
+        image_id_file = root / "image-id"
+        command = ["docker", "build", "--iidfile", str(image_id_file)]
+        if force_build:
+            command.append("--no-cache")
+        if tag is not None:
+            command.extend(["--tag", tag])
+        # Supply the Dockerfile through stdin so COPY . includes only source,
+        # not generated build instructions, task metadata, or the image ID file.
+        command.extend(["--file", "-", str(context)])
+        subprocess.run(command, input=dockerfile, text=True, check=True)
+        image_id = image_id_file.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", image_id):
+            raise RuntimeError("Docker build did not produce a valid image ID")
+        return image_id
+
+
+def build_testbed_image(
+    task: Task, strict: bool = True, force_build: bool = False, *,
+    backend: str = "modal", tag: str | None = None,
+) -> modal.Image | str:
     """Build the image holding the repository under test at its base commit.
 
     Args:
         task: The task whose Dockerfile and source checkout to build from.
         strict: Refuse to build when the checkout does not match the task's
             base commit. See `verify_source`.
-        force_build: Skip Modal's build cache.
+        force_build: Skip the selected backend's build cache.
+        backend: "modal" (default) or "docker" for a local Docker build.
+        tag: Optional Docker image tag. Only valid with backend="docker".
 
     Returns:
-        A Modal image with the repository installed at /testbed.
+        A Modal image, or a local Docker image ID suitable for Environment's
+        image parameter with backend="docker". The task Dockerfile determines
+        the repository location (normally /testbed). Dependency downloads may
+        require network access. Docker staging rejects source symlinks.
     """
+    if backend not in {"modal", "docker"}:
+        raise ValueError(f"Unknown image backend: {backend!r}")
+    if tag is not None and (backend != "docker" or not tag.strip()):
+        raise ValueError("A nonempty tag is only supported with backend='docker'")
     verify_source(task, strict=strict)
 
     logger.info("Building %s from %s at %s", task.id, task.source, task.base_commit[:12])
+    if backend == "docker":
+        return _build_docker_image(task, force_build, tag)
     image = modal.Image.from_dockerfile(
         str(task.dockerfile),
         context_dir=str(task.source),

@@ -1,13 +1,131 @@
 import asyncio
+import json
 import posixpath
+import math
+import subprocess
 import time
 from pathlib import PurePath
 from typing import Any
 
 import modal
+from swerex import __version__ as swerex_version
+from swerex.deployment.docker import DockerDeployment
 from swerex.deployment.modal import ModalDeployment
 from swerex.runtime.abstract import Command
 from swerex.runtime.remote import RemoteRuntime
+from swerex.utils.free_port import find_free_port
+from swerex.utils.wait import _wait_until_alive
+
+
+class AssignmentDockerDeployment(DockerDeployment):
+    """Local SWE-ReX container with bounded lifetime and localhost control port.
+
+    Images must contain python3 and /bin/sh (and bash for shell commands).
+    A Python supervisor exits when the lifetime expires, so Docker stops the
+    whole container even if the harness process has disappeared.
+    """
+
+    def __init__(self, *, runtime_timeout: float, deployment_timeout: float,
+                 install_pipx: bool, published_ports: list[int] | None = None, **kwargs: Any):
+        if not math.isfinite(deployment_timeout) or deployment_timeout <= 0:
+            raise ValueError("deployment_timeout must be finite and positive")
+        super().__init__(**kwargs)
+        self._runtime_timeout = runtime_timeout
+        self._deployment_timeout = deployment_timeout
+        self._install_pipx = install_pipx
+        self.published_ports = dict.fromkeys(published_ports or [])
+        if any(type(port) is not int or not 1 <= port <= 65535 or port == 8880
+               for port in self.published_ports):
+            raise ValueError("Published ports must be 1..65535, excluding SWE-ReX port 8880")
+
+    def _get_swerex_start_cmd(self, token: str) -> list[str]:
+        args = f"--port 8880 --auth-token {token}"
+        return ["/bin/sh", "-c", (
+            f"swerex-remote {args} || (python3 -m pip install pipx && "
+            f"python3 -m pipx run --spec swe-rex=={swerex_version} swerex-remote {args})"
+        )]
+
+    async def start(self) -> None:
+        if self._container_name is not None:
+            raise RuntimeError("Docker deployment is already started")
+        self._pull_image()
+        self._config.port = self._config.port or find_free_port()
+        self._container_name = self._get_container_name()
+        token = self._get_token()
+        command = (self._get_swerex_start_cmd(token) if self._install_pipx
+                   else ["swerex-remote", "--port", "8880", "--auth-token", token])
+        supervisor = (
+            "import subprocess,sys\n"
+            "try:\n"
+            "    code = subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode\n"
+            "except subprocess.TimeoutExpired:\n"
+            "    code = 124\n"
+            "sys.exit(code)\n"
+        )
+        try:
+            publish_args = []
+            for port in self.published_ports:
+                # Docker chooses the host port atomically, avoiding collisions.
+                publish_args.extend(["--publish", f"127.0.0.1:0:{port}"])
+            # Override any image entrypoint so the supervisor owns PID 1.
+            self._container_process = subprocess.Popen(
+                ["docker", "run", "--rm", "--publish",
+                 f"127.0.0.1:{self._config.port}:8880", *publish_args,
+                 "--name", self._container_name,
+                 "--entrypoint", "python3", self._config.image,
+                 "-c", supervisor, str(self._deployment_timeout), *command],
+                # Inherit logs: reading a live container's PIPE on timeout can hang.
+            )
+            self._runtime = RemoteRuntime(
+                host="http://127.0.0.1", port=self._config.port,
+                timeout=self._runtime_timeout, auth_token=token,
+            )
+            await _wait_until_alive(
+                self.is_alive, timeout=self._config.startup_timeout,
+                function_timeout=min(self._runtime_timeout, 1),
+            )
+            if self.published_ports:
+                bindings = json.loads(subprocess.check_output(
+                    ["docker", "inspect", "--format", "{{json .NetworkSettings.Ports}}",
+                     self._container_name], text=True, timeout=10,
+                ))
+                for port in self.published_ports:
+                    binding = bindings[f"{port}/tcp"]
+                    if len(binding) != 1 or binding[0]["HostIp"] != "127.0.0.1":
+                        raise RuntimeError(f"Port {port} is not bound exclusively to localhost")
+                    self.published_ports[port] = int(binding[0]["HostPort"])
+        except BaseException as exc:
+            try:
+                await self.stop()
+            except Exception as cleanup_error:
+                exc.add_note(f"Docker cleanup also failed: {cleanup_error}")
+            raise
+
+    async def is_alive(self, *, timeout: float | None = None):
+        if (self._runtime is None or self._container_process is None
+                or self._container_process.poll() is not None):
+            return False
+        return await self._runtime.is_alive(timeout=timeout)
+
+    async def stop(self) -> None:
+        # Removing the container terminates its runtime and every child command.
+        # Do this even when HTTP is broken or startup only partially completed.
+        if self._container_name is not None:
+            result = await asyncio.to_thread(
+                subprocess.run, ["docker", "rm", "--force", self._container_name],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode and "No such container" not in result.stderr:
+                raise RuntimeError(f"Docker cleanup failed: {result.stderr.strip()}")
+        if self._container_process is not None:
+            try:
+                await asyncio.to_thread(self._container_process.wait, timeout=5)
+            except subprocess.TimeoutExpired:
+                self._container_process.kill()
+                await asyncio.to_thread(self._container_process.wait, timeout=5)
+        self._runtime = None
+        self._container_process = None
+        self._container_name = None
 
 
 def _tls_port_configuration(
@@ -96,7 +214,7 @@ class AssignmentModalDeployment(ModalDeployment):
 
 class Environment:
     """
-    Executes bash commands in a Modal sandbox via SWE-ReX.
+    Executes bash commands in a Modal or local Docker sandbox via SWE-ReX.
     """
 
     # NOTE(source): https://github.com/SWE-agent/mini-swe-agent/blob/main/src/minisweagent/environments/extra/swerex_modal.py
@@ -111,8 +229,10 @@ class Environment:
         install_pipx: bool = True,
         modal_sandbox_kwargs: dict[str, Any] | None = None,
         conda_env: str | None = None,
+        backend: str = "modal",
+        published_ports: list[int] | None = None,
     ):
-        """Launch a Modal sandbox and block until its runtime answers.
+        """Launch a sandbox and block until its runtime answers.
 
         Args:
             image: A prebuilt `modal.Image`, a Dockerhub or ECR image name, or a
@@ -121,9 +241,9 @@ class Environment:
                 way to pass a credential to a private clone.
             cwd: Working directory for commands that do not specify one.
             startup_timeout: Seconds to wait for the SWE-ReX runtime to come up.
-            runtime_timeout: Seconds a single command may run before timing out.
-            deployment_timeout: Seconds the sandbox may stay alive before Modal
-                reclaims it.
+            runtime_timeout: Timeout for SWE-ReX health requests. Command limits
+                are supplied separately to execute(timeout=...).
+            deployment_timeout: Maximum sandbox lifetime in seconds.
             install_pipx: Install pipx in the image, needed to bootstrap the
                 SWE-ReX server when it is not already present.
             modal_sandbox_kwargs: Additional keyword arguments forwarded to
@@ -134,33 +254,65 @@ class Environment:
                 an environment named ``testbed`` but never activate it, so
                 without this ``python`` is conda's base environment, where the
                 repository and its dependencies are not installed.
+            backend: "modal" (default) or "docker". Docker requires a prebuilt
+                image name, with python3, /bin/sh, and bash. install_pipx=False
+                requires swerex-remote already installed in the image. Docker
+                does not accept Modal images, Dockerfile paths, or Modal kwargs.
+            published_ports: Docker container ports to publish on automatically
+                allocated localhost ports. Use tunnel_url() to get their URLs.
         """
+        if backend not in {"modal", "docker"}:
+            raise ValueError(f"Unknown environment backend: {backend!r}")
+        self.backend = backend
+        if backend == "docker":
+            for name, value in (("startup_timeout", startup_timeout),
+                                ("runtime_timeout", runtime_timeout)):
+                if not math.isfinite(value) or value <= 0:
+                    raise ValueError(f"{name} must be finite and positive")
         self.cwd = cwd
         # Merged into every command's environment; a per-call `env` wins.
         self.env_defaults: dict[str, str] = {}
-        self.deployment = AssignmentModalDeployment(
+        deployment_kwargs = dict(
             image=image,
             startup_timeout=startup_timeout,
             runtime_timeout=runtime_timeout,
             deployment_timeout=deployment_timeout,
             install_pipx=install_pipx,
-            modal_sandbox_kwargs=modal_sandbox_kwargs,
         )
+        if backend == "docker":
+            if not isinstance(image, str) or not image.strip():
+                raise TypeError("Docker requires a nonempty prebuilt image name")
+            if modal_sandbox_kwargs:
+                raise ValueError("modal_sandbox_kwargs cannot be used with Docker")
+            self.deployment = AssignmentDockerDeployment(
+                **deployment_kwargs, published_ports=published_ports,
+            )
+        else:
+            if published_ports:
+                raise ValueError("published_ports is only supported with Docker")
+            self.deployment = AssignmentModalDeployment(
+                **deployment_kwargs, modal_sandbox_kwargs=modal_sandbox_kwargs,
+            )
 
         async def _start():
             await self.deployment.start()
-            await self.deployment.is_alive()
+            if not await self.deployment.is_alive():
+                raise RuntimeError("Sandbox runtime did not become ready")
 
-        asyncio.run(_start())
-
-        if conda_env:
-            self.activate_conda_env(conda_env)
-
-        # Read the platform from inside the container, not from platform.uname(),
-        # which would describe the machine running this code instead.
-        self.system, self.release, self.version, self.machine = self.execute(
-            "uname -s; uname -r; uname -v; uname -m"
-        )["output"].splitlines()
+        try:
+            asyncio.run(_start())
+            if conda_env:
+                self.activate_conda_env(conda_env)
+            # Read the platform inside the sandbox, not on the harness host.
+            self.system, self.release, self.version, self.machine = self.execute(
+                "uname -s; uname -r; uname -v; uname -m"
+            )["output"].splitlines()
+        except BaseException as exc:
+            try:
+                self.stop()
+            except Exception as cleanup_error:
+                exc.add_note(f"Sandbox cleanup also failed: {cleanup_error}")
+            raise
 
     def is_alive(self) -> bool:
         """Whether the sandbox is still running.
@@ -169,6 +321,11 @@ class Environment:
         deployment keeps its handle afterwards, so this asks the sandbox itself
         rather than trusting the handle's existence.
         """
+        if self.backend == "docker":
+            try:
+                return bool(asyncio.run(self.deployment.is_alive(timeout=2)))
+            except Exception:
+                return False
         sandbox = self.deployment._sandbox
         return sandbox is not None and sandbox.poll() is None
 
@@ -226,8 +383,7 @@ class Environment:
 
         Returns:
             A dict with `output`, `returncode`, and `exception_info`. `output`
-            holds stdout and stderr interleaved, as they would appear in a
-            terminal. `exception_info` is empty when the command ran, whatever
+            holds stdout followed by stderr. `exception_info` is empty when the command ran, whatever
             its exit code. If the call itself fails (the sandbox died, the
             command timed out), the exception is caught rather than raised:
             `returncode` is -1, `exception_info` describes it, and an `extra` key
@@ -294,6 +450,9 @@ class Environment:
         """
 
         async def _stop():
+            if self.backend == "docker":
+                await asyncio.wait_for(self.deployment.stop(), timeout=timeout)
+                return
             # ModalDeployment.stop() has an inverted poll() check and only
             # terminates sandboxes that have *already* exited, so a live sandbox
             # leaks until deployment_timeout. Terminate it explicitly. Grab the
@@ -309,6 +468,12 @@ class Environment:
 
     def tunnel_url(self, port: int) -> str:
         """Return the public URL for a port forwarded when the sandbox started."""
+
+        if self.backend == "docker":
+            host_port = self.deployment.published_ports.get(port)
+            if host_port is None or self.deployment.container_name is None:
+                raise ValueError(f"Port {port} is not published by a running deployment")
+            return f"http://127.0.0.1:{host_port}"
 
         async def _tunnel_url() -> str:
             tunnels = await self.deployment.sandbox.tunnels.aio()

@@ -7,8 +7,8 @@
     # baseline: with no patch the FAIL_TO_PASS tests should still fail
     uv run python scripts/evaluate_swebench.py django__django-15368
 
-Nothing is built or fetched. The instance's image is published, and its tests
-and issue text are vendored under `tasks/swebench/`.
+The instance's published image is pulled when needed; its tests and issue text
+are vendored under `tasks/swebench/`.
 """
 
 import argparse
@@ -25,6 +25,7 @@ def main() -> int:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("instance_id", choices=available(), help="A vendored SWE-bench instance")
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument("--patch", type=Path, help="Unified diff to apply before testing")
     parser.add_argument(
         "--timeout", type=float, default=1800, help="Seconds allowed for the test command"
@@ -39,9 +40,7 @@ def main() -> int:
     instance = load_instance(args.instance_id)
     patch = args.patch.read_text() if args.patch else None
 
-    print(patch)
-
-    report = evaluate(instance, patch=patch, timeout=args.timeout)
+    report = evaluate(instance, patch=patch, timeout=args.timeout, backend=args.backend)
     print(report.summary())
     return 0 if report.resolved else 1
 

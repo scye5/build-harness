@@ -1,9 +1,10 @@
-"""Validate local assignment configuration without launching a Modal sandbox."""
+"""Validate assignment configuration without launching a sandbox."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 from urllib.parse import urlparse
 
 import httpx
@@ -27,6 +28,7 @@ def _configured(name: str) -> str | None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--backend", choices=("modal", "docker"), default="modal")
     parser.add_argument(
         "--offline",
         action="store_true",
@@ -45,11 +47,24 @@ def main() -> int:
         except (FileNotFoundError, SourceMismatch, ValueError) as exc:
             failures.append(f"{task_path}: {exc}")
 
-    modal_config = Config()
-    if modal_config.get("token_id") and modal_config.get("token_secret"):
-        print("[ok] Modal credentials are configured")
+    if args.backend == "docker":
+        try:
+            result = subprocess.run(
+                ["docker", "info", "--format", "{{.OSType}}"],
+                capture_output=True, text=True, timeout=15, check=True,
+            )
+            if result.stdout.strip() != "linux":
+                failures.append("Docker must use Linux containers")
+            else:
+                print("[ok] local Docker daemon is available (Linux containers)")
+        except (OSError, subprocess.SubprocessError):
+            failures.append("Docker is unavailable; start Docker Desktop and enable WSL integration")
     else:
-        failures.append("Modal credentials are missing; run `uv run modal setup`")
+        modal_config = Config()
+        if modal_config.get("token_id") and modal_config.get("token_secret"):
+            print("[ok] Modal credentials are configured")
+        else:
+            failures.append("Modal credentials are missing; run `uv run modal setup`")
 
     api_key = _configured("OPENAI_API_KEY")
     base_url = _configured("OPENAI_BASE_URL")
@@ -101,9 +116,9 @@ def main() -> int:
     if failures:
         for failure in failures:
             print(f"[error] {failure}")
-        print("Configuration is not ready; no Modal sandbox was launched.")
+        print("Configuration is not ready; no sandbox was launched.")
         return 1
-    print("Assignment configuration is ready; no Modal sandbox was launched.")
+    print("Assignment configuration is ready; no sandbox was launched.")
     return 0
 
 

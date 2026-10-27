@@ -276,7 +276,7 @@ def _grade(
     }
     return report
 
-def resolve_image(spec, task: Task | None, strict: bool):
+def resolve_image(spec, task: Task | None, strict: bool, backend: str = "modal"):
     """The image to grade in: published when one exists, otherwise built.
 
     Args:
@@ -290,7 +290,7 @@ def resolve_image(spec, task: Task | None, strict: bool):
     Raises:
         ValueError: If no image is published and no task was given to build.
     """
-    published = published_images().get(spec.task_id)
+    published = spec.image if isinstance(spec, Instance) else published_images().get(spec.task_id)
     if published:
         logger.info("Using published image for %s: %s", spec.task_id, published)
         return published
@@ -299,7 +299,7 @@ def resolve_image(spec, task: Task | None, strict: bool):
         raise ValueError(
             f"{spec.task_id!r} has no published image, so a task is needed to build one."
         )
-    return build_testbed_image(task, strict=strict)
+    return build_testbed_image(task, strict=strict, backend=backend)
 
 def evaluate(
     spec,
@@ -307,6 +307,7 @@ def evaluate(
     task: Task | None = None,
     timeout: float = 600,
     strict: bool = True,
+    backend: str = "modal",
 ) -> Report:
     """Build or fetch the testbed, apply a candidate patch, and grade it.
 
@@ -345,9 +346,16 @@ def evaluate(
         raise ValueError(f"Evaluation is for {spec.task_id!r}, not task {task.id!r}.")
 
     report = Report(task_id=spec.task_id, patch_applied=patch is None)
-    image = resolve_image(spec, task, strict)
+    if backend not in {"modal", "docker"}:
+        raise ValueError(f"Unknown environment backend: {backend!r}")
+    image = resolve_image(spec, task, strict, backend=backend)
 
-    with Environment(image=image, cwd=spec.cwd, runtime_timeout=timeout) as env:
+    with Environment(
+        image=image, cwd=spec.cwd, runtime_timeout=timeout, backend=backend,
+        conda_env="testbed" if spec.task_id in published_images() or isinstance(spec, Instance) else None,
+        # Allow startup and patch preparation in addition to the test budget.
+        deployment_timeout=timeout + 600,
+    ) as env:
         # Only substituted when the command asks for it, so a spec that names
         # its own interpreter keeps it.
         test_cmd = spec.test_cmd
