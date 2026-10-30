@@ -133,10 +133,84 @@ INVOKE_SKILL_TOOL = {
 # TODO(3.1.a): Define an OpenAI function-tool schema named ``play_move``.
 # It must accept exactly one required string argument named ``move``, explain
 # that moves use UCI notation (for example e2e4), and reject extra arguments.
-PLAY_MOVE_TOOL: dict = {}
+PLAY_MOVE_TOOL: dict = {
+    "type":"function",
+    "function":{
+        "name": "play_move",
+        "description": (
+            "Play one move as White and return the resulting state. "
+            "Moves use UCI notation, for example e2e4 and e7e8q."
+        ),
+        "strict":True,
+        "parameters":{
+            "type":"object",
+            "properties":{
+                "move":{
+                    "type":"string",
+                    "description":("The move to play, in UCI notation, for example e2e4 and e7e8q"),
+                },
+            },
+            "required":["move"],
+            "additionalProperties":False,
+        },
+    },
+}
 
-# TODO(3.3): Define the `simulate_move` tool, like the `play_move` tool.
-SIMULATE_MOVE_TOOL: dict = {}
+SIMULATE_MOVE_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "simulate_move",
+        "description": (
+            "Inspect a FEN position or simulate exactly one ply for either side "
+            "without changing the actual game board. "
+            "Return the resulting state, including legal moves and terminal status. "
+            "Moves use UCI notation, for example e2e4 and e7e8q."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fen": {
+                    "type": "string",
+                    "description": "The position to inspect or simulate from, as a complete six-field FEN.",
+                },
+                "move": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "The move to simulate, in UCI notation, for example e2e4 "
+                        "or e7e8q. Use null to inspect the position without moving."
+                    ),
+                },
+            },
+            "required": ["fen", "move"],
+            "additionalProperties": False,
+        },
+    },
+}
 
 # TODO()
-RUN_PYTHON_TOOL: dict = {}
+RUN_PYTHON_TOOL: dict = {
+    "type": "function",
+    "function": {
+        "name": "run_python",
+        "description": (
+            "Run Python code in the sandbox with simulate_move(fen, move=None) "
+            "and play_move(move) available by name. Simulation does not change "
+            "the actual game; play_move does. Return JSON containing stdout, "
+            "stderr, and error. Use print to report results. Each call runs "
+            "in a new interpreter; variables do not persist between calls."
+        ),
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "The Python code to run in the sandbox.",
+                },
+            },
+            "required": ["code"],
+            "additionalProperties": False,
+        },
+    },
+}

@@ -32,6 +32,10 @@ active, make a tool call instead of merely describing a move in text."""
 
 PROGRAMMATIC_CHESS_PROMPT = """Two additional tools are available: simulate_move and run_python.
 You may use Python to explore hypothetical positions before choosing a move.
+Each snippet has a 90-second execution budget. Keep search to at most two plies,
+reuse each returned state instead of inspecting its FEN again, and print only a
+short summary. Finish the snippet by calling play_move exactly once. Python
+variables do not persist between snippets. Follow a loaded skill's strategy.
 simulate_move(fen, move=None) returns a dict with FEN, squares, turn, legal_moves,
 and terminal status. simulate_move does not change the state of the board but allows for simulating
 the effects of taking an action on the board. Write Python code that uses simulate move to search

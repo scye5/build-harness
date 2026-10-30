@@ -446,6 +446,15 @@ class Agent:
                     # Domain-specific executors set self.finished on completion.
                     observations = self.execute_tool_calls(tool_calls)
                     self.history.extend(observations)
+                else:
+                    self.history.append({
+                        "role": "user",
+                        "content": (
+                            "The task is still active. Use an available tool to take "
+                            "the next action based on the latest observation; "
+                            "describing an action does not execute it."
+                        ),
+                    })
 
             # TODO(2.2) Call `maybe_compact_context()` before each new action
             # request in your shared loop. It already estimates active tokens

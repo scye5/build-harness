@@ -19,9 +19,9 @@ from assignment.agent.chess_tools import (
     CHESS_PORT,
     _run_python,
     _simulate_move,
+    ChessSandboxUnavailable,
 )
 from assignment.agent.tools import (
-    INVOKE_SKILL_TOOL,
     PLAY_MOVE_TOOL,
     RUN_PYTHON_TOOL,
     SIMULATE_MOVE_TOOL,
@@ -107,8 +107,10 @@ class ChessAgent(Agent):
         )
 
         # TODO(Part 3): Register the play_move tool schema from tools.py.
-
+        self.tools.append(PLAY_MOVE_TOOL)
+        
         if programmatic_tools:
+            self.tools.append(SIMULATE_MOVE_TOOL)
             self.tools.append(RUN_PYTHON_TOOL)
 
         # run_python always executes in the sandbox, on the port the chess
@@ -161,20 +163,57 @@ class ChessAgent(Agent):
     def execute_tool_calls(
         self, tool_calls: list[dict[str, Any]]
     ) -> list[dict[str, str]]:
-        """Execute model-generated ``play_move`` calls against the chess API."""
+        """Execute registered chess tools and return their observations."""
 
-        # TODO(Part 3.1):
-        # 1. Dispatch on the function name, and ignore a tool this agent did
-        #    not register.
-        # 2. Hand the raw arguments to the matching chess_tools helper, with
-        #    self.chess_client as its first argument. Each helper takes the
-        #    client explicitly so the same code can run inside the sandbox.
-        # 3. Format a played move with self.format_state, then update
-        #    last_state and finished.
-        # 4. Link every observation to its call with tool_call_id.
-        # 5. Turn malformed, unknown, rejected, or extra parallel calls into
-        #    recoverable <chess_error> observations instead of crashing.
-
-        # TODO(Part 3.3-4): add cases for simulate_move and run_python, with
-        # linked observations and recoverable errors, just like the old tool.
-        raise NotImplementedError
+        registered_names = {
+            tool.get("function", {}).get("name") for tool in self.tools
+        }
+        observations: list[dict[str, str]] = []
+        for index, call in enumerate(tool_calls):
+            call_id = call.get("id", "") if isinstance(call, dict) else ""
+            try:
+                if not isinstance(call, dict):
+                    raise ValueError("Tool call must be an object.")
+                if index > 0:
+                    raise ValueError("Only one tool call per turn is supported.")
+                function = call["function"]
+                name = function["name"]
+                if name not in registered_names:
+                    raise ValueError(f"Tool is not registered: {name}")
+                arguments = function["arguments"]
+                if name == "play_move":
+                    content = _play_move(self.chess_client, arguments)
+                    if not content.startswith("<chess_error>"):
+                        new_state = json.loads(content)
+                        if not isinstance(new_state, dict):
+                            raise ValueError("Chess state must be a JSON object.")
+                        content = self.format_state(new_state)
+                        self.last_state = new_state
+                        self.finished = bool(new_state.get("game_over"))
+                elif name == "simulate_move":
+                    content = _simulate_move(self.chess_client, arguments)
+                elif name == "run_python":
+                    content = _run_python(self.env, self.python_sandbox_port, arguments)
+                    # A snippet can commit a move even if it subsequently fails.
+                    # Refresh from the server rather than relying on its stdout.
+                    try:
+                        new_state = _game_state(self.chess_client)
+                        formatted_state = self.format_state(new_state)
+                        self.last_state = new_state
+                        self.finished = bool(new_state.get("game_over"))
+                        content += "\n\n" + formatted_state
+                    except Exception as exc:
+                        content += (
+                            "\n\n<chess_error>Failed to refresh live chess state: "
+                            f"{exc}</chess_error>"
+                        )
+                elif name == "invoke_skill":
+                    content = _invoke_skill(self.skills, arguments)
+                else:
+                    raise ValueError(f"Unknown tool: {name}")
+            except ChessSandboxUnavailable:
+                raise
+            except Exception as exc:
+                content = f"<chess_error>{exc}</chess_error>"
+            observations.append({"role": "tool", "tool_call_id": call_id, "content": content})
+        return observations

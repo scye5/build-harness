@@ -12,6 +12,9 @@ import io
 import json
 import sys
 import traceback
+import signal
+from copy import deepcopy
+from functools import lru_cache
 from contextlib import redirect_stderr, redirect_stdout
 
 import httpx
@@ -32,8 +35,12 @@ def build_tools(client: httpx.Client) -> dict:
             return json.loads(result)
         return result
 
-    def simulate_move(fen: str, move: str | None = None) -> dict:
+    @lru_cache(maxsize=4096)
+    def cached_simulation(fen: str, move: str | None = None) -> dict:
         return unwrap(_simulate_move(client, json.dumps({"fen": fen, "move": move})))
+
+    def simulate_move(fen: str, move: str | None = None) -> dict:
+        return deepcopy(cached_simulation(fen, move))
 
     def play_move(move: str) -> dict:
         return unwrap(_play_move(client, json.dumps({"move": move})))
@@ -43,17 +50,26 @@ def build_tools(client: httpx.Client) -> dict:
 def main() -> None:
     port, encoded = sys.argv[1], sys.argv[2]
     code = base64.b64decode(encoded).decode()
-    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=30)
+    client = httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=10, trust_env=False)
 
     namespace = {"__name__": "__agent__", **build_tools(client)}
     stdout, stderr = io.StringIO(), io.StringIO()
     error = None
+    def timed_out(signum, frame):
+        raise TimeoutError("Python exceeded 90 seconds. Reduce search depth and reuse simulated states.")
+
+    # Linux sandbox: return before the outer command/transport timeout.
+    signal.signal(signal.SIGALRM, timed_out)
+    signal.alarm(90)
     with redirect_stdout(stdout), redirect_stderr(stderr):
         try:
             exec(compile(code, "<agent-python>", "exec"), namespace, namespace)
         except BaseException as exc:
             error = f"{type(exc).__name__}: {exc}"
             traceback.print_exc(limit=4)
+        finally:
+            signal.alarm(0)
+            client.close()
 
     # The result is the only thing on the real stdout, so the caller can parse
     # it whatever the snippet printed.

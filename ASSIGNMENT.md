@@ -512,6 +512,22 @@ uv run assignment-play-chess \
 
 The trajectory must show `invoke_skill`, then `run_python` code that calls `simulate_move` to search and `play_move` once to commit. Reading the skill and then making one direct `play_move` call per turn does not demonstrate the tools working together. The game need not finish or be won.
 
+## Final Run
+Run the following command to play chess:
+```bash
+uv run assignment-play-chess \
+  --backend docker \
+  --programmatic-tools \
+  --patch artifacts/fix.patch \
+  --model deepseek-flash \
+  --skills-path tasks/chess-skills \
+  --sandbox-timeout 7200 \
+  --compact-threshold-tokens 12000 \
+  --trajectory artifacts/part3-python-skill-trajectory.json \
+  --result artifacts/part3-python-skill-result.json
+```
+
+
 ## Grading
 
 The assignment is worth **100 points**. Each row is graded independently; a

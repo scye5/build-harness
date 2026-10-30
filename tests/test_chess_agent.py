@@ -139,6 +139,20 @@ def test_play_move_posts_request_and_returns_new_state(make_agent, chess_client)
     assert make_agent.finished is False
 
 
+@pytest.mark.parametrize("move", ["e2e4", "e2e5"])
+def test_next_prompt_contains_linked_tool_message(make_agent, move):
+    call = tool_call(move)
+    make_agent.history.append({"role": "assistant", "tool_calls": [call]})
+    make_agent.history.extend(make_agent.execute_tool_calls([call]))
+
+    messages = make_agent.build_prompt()
+    assert [message["role"] for message in messages] == [
+        "system", "user", "assistant", "tool"
+    ]
+    assert messages[3]["tool_call_id"] == call["id"]
+    assert isinstance(messages[3]["content"], str)
+
+
 def test_rejected_and_malformed_moves_are_recoverable(make_agent):
     rejected = make_agent.execute_tool_calls([tool_call("e2e5")])
     malformed_call = tool_call("e2e4", "move_2")
@@ -148,3 +162,32 @@ def test_rejected_and_malformed_moves_are_recoverable(make_agent):
     assert "<chess_error>" in rejected[0]["content"]
     assert "<chess_error>" in malformed[0]["content"]
     assert make_agent.finished is False
+
+
+def test_extra_parallel_call_is_not_executed(make_agent, chess_client):
+    messages = make_agent.execute_tool_calls(
+        [tool_call("e2e4"), tool_call("e2e4", "move_2")]
+    )
+
+    assert messages[1]["tool_call_id"] == "move_2"
+    assert "<chess_error>" in messages[1]["content"]
+    assert sum(r.url.path == "/api/move" for r in chess_client.requests) == 1
+
+
+def test_unregistered_tool_is_not_executed(make_agent, chess_client):
+    make_agent.tools = []
+    request_count = len(chess_client.requests)
+    messages = make_agent.execute_tool_calls([tool_call("e2e4")])
+
+    assert messages[0]["tool_call_id"] == "move_1"
+    assert "<chess_error>" in messages[0]["content"]
+    assert len(chess_client.requests) == request_count
+
+
+@pytest.mark.parametrize("call", [None, {}, {"id": "bad", "function": None}])
+def test_malformed_call_structure_is_recoverable(make_agent, call):
+    messages = make_agent.execute_tool_calls([call])
+
+    assert len(messages) == 1
+    assert "<chess_error>" in messages[0]["content"]
+    assert make_agent.last_state == INITIAL_STATE
